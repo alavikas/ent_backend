@@ -1,0 +1,9 @@
+.env
+sa-key.json
+client_secret.json
+token.json
+out/
+__pycache__/
+*.pyc
+.DS_Store
+venv/

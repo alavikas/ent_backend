@@ -482,3 +482,27 @@ def export_pdf(
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Export error: {e}")
+@app.post("/export_pdf_file")
+def export_pdf_file(
+    patient: dict = Body(...),
+    ai: dict = Body(...),
+    raw_text: str = Body(""),
+    image_b64: str | None = Body(None)
+):
+    """
+    Build a PDF and return it directly as bytes (no Google Drive upload).
+    """
+    try:
+        img_bytes = base64.b64decode(image_b64) if image_b64 else None
+        pdf_path = generate_pdf(patient, ai, raw_text, img_bytes)
+        data = open(pdf_path, "rb").read()
+        filename = os.path.basename(pdf_path)
+        return Response(
+            content=data,
+            media_type="application/pdf",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'}
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Export bytes error: {e}")

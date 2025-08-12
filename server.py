@@ -1,9 +1,10 @@
-import os, json, base64
+import os, json, base64, io
 from typing import Any, Dict, List
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, UploadFile, File, HTTPException, Body
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response  # <-- needed for /export_pdf_file
 from pydantic import BaseModel
 from openai import OpenAI
 
@@ -18,13 +19,13 @@ from googleapiclient.http import MediaFileUpload
 # =======================
 # Setup
 # =======================
-load_dotenv()  # reads .env in this folder
+load_dotenv()
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-MODEL_VISION_TEXT = "gpt-4o-mini"  # Vision + Text model
+MODEL_VISION_TEXT = "gpt-4o-mini"
 
 app = FastAPI(title="Vikas ENT AI – OCR + Analysis")
 
-# Allow local devices (your phone) to call the server; tighten origins later for production
+# Loosened CORS for testing; tighten for production
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -95,10 +96,7 @@ COMPLAINT_PROFILES = {
         "default_tests": ["Anterior rhinoscopy / endoscopy", "CT PNS if indicated", "Allergy testing if relevant"],
     },
     "Lump in Throat": {
-        "required_keys": [
-            "Duration", "Dysphagia", "Odynophagia", "Weight loss",
-            "Hoarseness", "Reflux symptoms", "Neck mass"
-        ],
+        "required_keys": ["Duration", "Dysphagia", "Odynophagia", "Weight loss", "Hoarseness", "Reflux symptoms", "Neck mass"],
         "red_flags": ["progressive dysphagia", "odynophagia", "weight loss", "neck mass", "voice change"],
         "rules": {
             "Globus pharyngeus": [("Reflux symptoms", "YES", 0.4), ("Intermittent symptoms", "YES", 0.2)],
@@ -215,17 +213,11 @@ def openai_vision_ocr(image_bytes: bytes) -> str:
         resp = client.chat.completions.create(
             model=MODEL_VISION_TEXT,
             messages=[
-                {
-                    "role": "system",
-                    "content": "You are an OCR engine. Extract all readable text as plain UTF-8. Preserve line breaks. Output only text."
-                },
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": "Extract raw text from this photo. Keep formatting and line breaks."},
-                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}}
-                    ]
-                }
+                {"role": "system", "content": "You are an OCR engine. Extract all readable text as plain UTF-8. Preserve line breaks. Output only text."},
+                {"role": "user", "content": [
+                    {"type": "text", "text": "Extract raw text from this photo. Keep formatting and line breaks."},
+                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}}
+                ]}
             ],
             temperature=0
         )
@@ -314,7 +306,6 @@ Return STRICT JSON only:
 # PDF + Google Drive helpers
 # =======================
 def _bullet_wrap(c: canvas.Canvas, x, y, text, max_width):
-    # simple wrap for bullets
     from reportlab.pdfbase.pdfmetrics import stringWidth
     words = (text or "").split()
     line = ""
@@ -332,7 +323,6 @@ def _bullet_wrap(c: canvas.Canvas, x, y, text, max_width):
     return y
 
 def generate_pdf(patient: dict, ai: dict, raw_text: str, img_bytes: bytes | None) -> str:
-    # returns absolute file path
     from datetime import datetime
     os.makedirs("out", exist_ok=True)
     filename = f"out/{(patient.get('name') or 'patient').replace(' ', '_')}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
@@ -377,7 +367,7 @@ def generate_pdf(patient: dict, ai: dict, raw_text: str, img_bytes: bytes | None
     title("Clinical / Lab tests to be done")
     tests = []
     for d in diffs: tests += d.get("tests", [])
-    tests = list(dict.fromkeys(tests))  # unique
+    tests = list(dict.fromkeys(tests))
     if not tests: c.drawString(x, y, "—"); y -= 14
     for t in tests: y = _bullet_wrap(c, x, y, t, W-3*cm)
 
@@ -432,10 +422,6 @@ def health():
 
 @app.post("/ocr_analyze")
 async def ocr_analyze(file: UploadFile = File(...), complaint: str = "Vertigo"):
-    """
-    Upload a questionnaire photo once; server does OCR + clinical analysis.
-    Returns: { raw_text, parsed_fields, provisional, differentials[], red_flags[], next_steps[] }
-    """
     try:
         image_bytes = await file.read()
         raw = openai_vision_ocr(image_bytes)
@@ -453,10 +439,6 @@ class AnalyzePayload(BaseModel):
 
 @app.post("/analyze")
 def analyze(p: AnalyzePayload):
-    """
-    Optional endpoint if you already have structured fields on the app side.
-    Produces differentials + tests from key:value pairs.
-    """
     txt = " ".join([f"{k}: {v}" for k, v in (p.responses or {}).items()])
     raw = f"Complaint: {p.patient.complaint}\nAge: {p.patient.age}\n{txt}"
     return openai_clinical_analyze(raw_text=raw, complaint_hint=p.patient.complaint or "ENT")
@@ -468,10 +450,7 @@ def export_pdf(
     raw_text: str = Body(""),
     image_b64: str | None = Body(None)
 ):
-    """
-    Build a PDF from {patient, ai, raw_text} (+ optional image) and upload to Google Drive.
-    Returns {ok, file:{id, webViewLink, webContentLink}, pdf_path}.
-    """
+    """Build a PDF then upload to Google Drive; return links."""
     try:
         img_bytes = base64.b64decode(image_b64) if image_b64 else None
         pdf_path = generate_pdf(patient, ai, raw_text, img_bytes)
@@ -482,6 +461,7 @@ def export_pdf(
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Export error: {e}")
+
 @app.post("/export_pdf_file")
 def export_pdf_file(
     patient: dict = Body(...),
@@ -489,18 +469,17 @@ def export_pdf_file(
     raw_text: str = Body(""),
     image_b64: str | None = Body(None)
 ):
-    """
-    Build a PDF and return it directly as bytes (no Google Drive upload).
-    """
+    """Build a PDF and return it directly as bytes (for local device save)."""
     try:
         img_bytes = base64.b64decode(image_b64) if image_b64 else None
         pdf_path = generate_pdf(patient, ai, raw_text, img_bytes)
-        data = open(pdf_path, "rb").read()
+        with open(pdf_path, "rb") as f:
+            data = f.read()
         filename = os.path.basename(pdf_path)
         return Response(
             content=data,
             media_type="application/pdf",
-            headers={"Content-Disposition": f'attachment; filename="{filename}"'}
+            headers={"Content-Disposition": f'attachment; filename=\"{filename}\"'}
         )
     except HTTPException:
         raise
